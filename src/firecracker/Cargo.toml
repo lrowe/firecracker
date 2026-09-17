@@ -60,6 +60,10 @@ name = "uffd_on_demand_handler"
 path = "examples/uffd/on_demand_handler.rs"
 
 [[example]]
+name = "uffd_shared_on_demand_handler"
+path = "examples/uffd/shared_on_demand_handler.rs"
+
+[[example]]
 name = "uffd_fault_all_handler"
 path = "examples/uffd/fault_all_handler.rs"
 

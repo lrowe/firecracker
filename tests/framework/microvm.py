@@ -1082,6 +1082,7 @@ class Microvm:
             mem_backend = {
                 "backend_type": "Uffd",
                 "backend_path": str(self.uffd_handler.socket_path),
+                "uffd_shared": uffd_handler_name == "shared_on_demand",
             }
 
         for key, value in jailed_snapshot.meta.items():

@@ -109,6 +109,23 @@ def test_valid_handler(uvm, snapshot):
 
 
 @pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_shared_on_demand_handler(uvm, snapshot):
+    """Test restoring with a shared UFFD backing memfd."""
+    vm = uvm
+    vm.memory_monitor = None
+    vm.spawn()
+    vm.restore_from_snapshot(
+        snapshot, resume=True, uffd_handler_name="shared_on_demand"
+    )
+
+    vm.ssh.check_output("true")
+    vm.api.balloon.patch(amount_mib=200)
+    vm.ssh.check_output("true")
+    vm.api.balloon.patch(amount_mib=0)
+    vm.ssh.check_output("true")
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 def test_malicious_handler(uvm, snapshot):
     """
     Test malicious uffd handler scenario.

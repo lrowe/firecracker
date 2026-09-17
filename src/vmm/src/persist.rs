@@ -594,8 +594,11 @@ fn guest_memory_from_uffd(
     };
 
     let guest_memory = if let Some(mut socket) = socket.as_ref() {
-        let request = serde_json::to_string(&UffdRequest { uffd_shared: true })
-            .map_err(|_| GuestMemoryFromUffdError::MemfdRequest)?;
+        let request = format!(
+            "{}\n",
+            serde_json::to_string(&UffdRequest { uffd_shared: true })
+                .map_err(|_| GuestMemoryFromUffdError::MemfdRequest)?
+        );
         socket
             .write_all(request.as_bytes())
             .map_err(|_| GuestMemoryFromUffdError::MemfdRequest)?;

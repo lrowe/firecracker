@@ -203,6 +203,14 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(stream: UnixStream, backing_file: File) -> Self {
+        Self::new_with_flags(stream, backing_file, libc::MAP_PRIVATE)
+    }
+
+    pub fn new_shared(stream: UnixStream, backing_file: File) -> Self {
+        Self::new_with_flags(stream, backing_file, libc::MAP_SHARED)
+    }
+
+    fn new_with_flags(stream: UnixStream, backing_file: File, map_flags: i32) -> Self {
         let file_meta = backing_file
             .metadata()
             .expect("can not get backing file metadata");
@@ -214,7 +222,7 @@ impl Runtime {
                 ptr::null_mut(),
                 backing_memory_size,
                 libc::PROT_READ,
-                libc::MAP_PRIVATE | libc::MAP_POPULATE,
+                map_flags | libc::MAP_POPULATE,
                 backing_file.as_raw_fd(),
                 0,
             )

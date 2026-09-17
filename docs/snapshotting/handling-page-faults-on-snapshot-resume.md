@@ -72,6 +72,8 @@ Below is the interaction flow between Firecracker and the page fault handler
 Please note that when using the Jailer, the page fault handler process, UDS and
 memory file must reside inside the jail. The UDS must only be accessible to
 Firecracker and the page fault handler.
+The shared handler also requires access to the original snapshot memory file;
+the transferred memfd does not require a pathname in the jail.
 
 - PUT snapshot/load API call is issued towards Firecracker's API thread. The
   request encapsulates in its body the path to the unix domain socket that page
@@ -107,9 +109,16 @@ Firecracker and the page fault handler.
   happens, the page fault handler issues `UFFDIO_COPY` to load the previously
   mmaped file contents into the correspondent memory region.
 
-After Firecracker sends the payload (i.e. mem mappings and file descriptor), no
-other communication happens on the UDS socket (or otherwise) between Firecracker
-and the page fault handler process.
+For the legacy UFFD flow, after Firecracker sends the payload (i.e. mem mappings
+and file descriptor), no other communication happens on the UDS socket. A
+shared UFFD handler uses a two-stage flow on the same connection instead:
+Firecracker first sends the newline-terminated JSON request
+`{"uffd_shared":true}`, and the handler replies with an empty payload and one
+memfd containing the complete snapshot memory file. Firecracker validates the
+memfd size and maps it privately (`MAP_PRIVATE`) so each restored guest keeps
+copy-on-write isolation. The handler retains the memfd and maps a shared view
+(`MAP_SHARED`) as its page-fault source. Firecracker then sends the usual UFFD
+mapping and descriptor handshake on the same socket.
 
 ### Userfaultfd interaction with balloon
 
@@ -166,3 +175,8 @@ An example of a handler process can be found
 designed to tackle faults on a certain address by loading into memory the entire
 region that the address belongs to, but users can choose any other behavior that
 suits their use case best.
+
+The shared backing-store variant is available
+[here](../../src/firecracker/examples/uffd/shared_on_demand_handler.rs). It
+performs the preliminary memfd exchange described above before handling UFFD
+events.
