@@ -492,6 +492,7 @@ pub fn restore_from_snapshot(
             mem_state,
             track_dirty_pages,
             vm_resources.machine_config.huge_pages,
+            params.mem_backend.uffd_shared,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
@@ -566,6 +567,17 @@ pub enum GuestMemoryFromUffdError {
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
     Send(#[from] vmm_sys_util::errno::Error),
+    /// Failed to request a shared memfd from the UFFD backend.
+    MemfdRequest,
+    /// The UFFD backend did not send a memfd.
+    MissingMemfd,
+    /// The shared memfd size does not match the snapshot guest memory size.
+    MemfdSizeMismatch {
+        /// Expected size
+        expected: u64,
+        /// Actual size
+        actual: u64,
+    },
 }
 
 fn guest_memory_from_uffd(
@@ -573,9 +585,51 @@ fn guest_memory_from_uffd(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    uffd_shared: bool,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
-    let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
+    let socket = if uffd_shared {
+        Some(UnixStream::connect(mem_uds_path)?)
+    } else {
+        None
+    };
+
+    let guest_memory = if let Some(mut socket) = socket.as_ref() {
+        let request = serde_json::to_string(&UffdRequest { uffd_shared: true })
+            .map_err(|_| GuestMemoryFromUffdError::MemfdRequest)?;
+        socket
+            .write_all(request.as_bytes())
+            .map_err(|_| GuestMemoryFromUffdError::MemfdRequest)?;
+
+        let mut response = [0u8; 1];
+        let (bytes_read, memfd) = socket
+            .recv_with_fd(&mut response)
+            .map_err(|_| GuestMemoryFromUffdError::MemfdRequest)?;
+        if bytes_read != 0 {
+            return Err(GuestMemoryFromUffdError::MemfdRequest);
+        }
+        let memfd = memfd.ok_or(GuestMemoryFromUffdError::MissingMemfd)?;
+
+        let expected_size: u64 = mem_state
+            .regions
+            .iter()
+            .map(|region| region.size as u64)
+            .sum();
+        let actual_size = memfd
+            .metadata()
+            .map_err(|_| GuestMemoryFromUffdError::MemfdRequest)?
+            .len();
+        if actual_size != expected_size {
+            return Err(GuestMemoryFromUffdError::MemfdSizeMismatch {
+                expected: expected_size,
+                actual: actual_size,
+            });
+        }
+
+        memory::snapshot_file(memfd, mem_state.regions(), track_dirty_pages, huge_pages)?
+    } else {
+        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?.0
+    };
+    let backend_mappings = create_guest_memory_mappings(&guest_memory, huge_pages);
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -597,17 +651,25 @@ fn guest_memory_from_uffd(
             .map_err(GuestMemoryFromUffdError::Register)?;
     }
 
-    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
+    if let Some(socket) = socket.as_ref() {
+        send_uffd_handshake_on_socket(socket, &backend_mappings, &uffd)?;
+    } else {
+        send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
+    }
+    forget(socket);
 
     Ok((guest_memory, Some(uffd)))
 }
 
-fn create_guest_memory(
-    mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
+#[derive(Debug, Serialize, Deserialize)]
+struct UffdRequest {
+    uffd_shared: bool,
+}
+
+fn create_guest_memory_mappings(
+    guest_memory: &[GuestRegionMmap],
     huge_pages: HugePageConfig,
-) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+) -> Vec<GuestRegionUffdMapping> {
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
     for mem_region in guest_memory.iter() {
@@ -621,7 +683,16 @@ fn create_guest_memory(
         });
         offset += mem_region.size() as u64;
     }
+    backend_mappings
+}
 
+fn create_guest_memory(
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
+    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    let backend_mappings = create_guest_memory_mappings(&guest_memory, huge_pages);
     Ok((guest_memory, backend_mappings))
 }
 
@@ -675,6 +746,16 @@ fn send_uffd_handshake(
     // handler first, the handler never sees the mappings.
     forget(socket);
 
+    Ok(())
+}
+
+fn send_uffd_handshake_on_socket(
+    socket: &UnixStream,
+    backend_mappings: &[GuestRegionUffdMapping],
+    uffd: &impl AsRawFd,
+) -> Result<(), GuestMemoryFromUffdError> {
+    let backend_mappings = serde_json::to_string(backend_mappings).unwrap();
+    socket.send_with_fd(backend_mappings.as_bytes(), uffd.as_raw_fd())?;
     Ok(())
 }
 

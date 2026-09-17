@@ -172,6 +172,9 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// Request a shared memfd from the UFFD backend before creating guest memory.
+    #[serde(default)]
+    pub uffd_shared: bool,
 }
 
 /// The microVM state options.
