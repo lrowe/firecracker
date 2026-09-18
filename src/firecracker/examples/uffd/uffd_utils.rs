@@ -14,7 +14,6 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
-use std::ptr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -48,11 +47,17 @@ impl GuestRegionUffdMapping {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct FaultPage {
+    pub dst: *mut c_void,
+    pub len: usize,
+    pub backing_offset: u64,
+}
+
 #[derive(Debug)]
 pub struct UffdHandler {
     pub mem_regions: Vec<GuestRegionUffdMapping>,
     pub page_size: usize,
-    backing_buffer: *const u8,
     uffd: Uffd,
 }
 
@@ -97,7 +102,7 @@ impl UffdHandler {
         panic!("Could not get UFFD and mappings after 5 retries");
     }
 
-    pub fn from_unix_stream(stream: &UnixStream, backing_buffer: *const u8, size: usize) -> Self {
+    pub fn from_unix_stream(stream: &UnixStream, size: usize) -> Self {
         let (body, file) = Self::get_mappings_and_file(stream);
         let mappings =
             serde_json::from_str::<Vec<GuestRegionUffdMapping>>(&body).unwrap_or_else(|_| {
@@ -122,7 +127,6 @@ impl UffdHandler {
         Self {
             mem_regions: mappings,
             page_size,
-            backing_buffer,
             uffd,
         }
     }
@@ -144,14 +148,17 @@ impl UffdHandler {
             .expect("range should be valid");
     }
 
-    pub fn serve_pf(&mut self, addr: *mut u8, len: usize) -> bool {
+    pub fn fault_page(&self, addr: *mut u8, len: usize) -> FaultPage {
         // Find the start of the page that the current faulting address belongs to.
         let dst = (addr as usize & !(self.page_size - 1)) as *mut libc::c_void;
         let fault_page_addr = dst as u64;
-
         for region in self.mem_regions.iter() {
             if region.contains(fault_page_addr) {
-                return self.populate_from_file(region, fault_page_addr, len);
+                return FaultPage {
+                    dst,
+                    len,
+                    backing_offset: region.offset + fault_page_addr - region.base_host_virt_addr,
+                };
             }
         }
 
@@ -161,12 +168,10 @@ impl UffdHandler {
         );
     }
 
-    fn populate_from_file(&self, region: &GuestRegionUffdMapping, dst: u64, len: usize) -> bool {
-        let offset = dst - region.base_host_virt_addr;
-        let src = self.backing_buffer as u64 + region.offset + offset;
-
+    pub fn copy_fault(&self, backing_memory: *const u8, fault: FaultPage) -> bool {
+        let src = backing_memory as u64 + fault.backing_offset;
         unsafe {
-            match self.uffd.copy(src as *const _, dst as *mut _, len, true) {
+            match self.uffd.copy(src as *const _, fault.dst, fault.len, true) {
                 // Make sure the UFFD copied some bytes.
                 Ok(value) => assert!(value > 0),
                 // Catch EAGAIN errors, which occur when a `remove` event lands in the UFFD
@@ -190,52 +195,29 @@ impl UffdHandler {
 
         true
     }
+
+    pub fn continue_fault(&self, fault: FaultPage) -> bool {
+        match self.uffd.r#continue(fault.dst, fault.len, true) {
+            Ok(value) => assert!(value > 0),
+            Err(error) => panic!("Uffd continue failed: {error:?}"),
+        }
+
+        true
+    }
 }
 
 #[derive(Debug)]
 pub struct Runtime {
     stream: UnixStream,
-    backing_file: File,
-    backing_memory: *mut u8,
-    backing_memory_size: usize,
+    memory_size: usize,
     uffds: HashMap<i32, UffdHandler>,
 }
 
 impl Runtime {
-    pub fn new(stream: UnixStream, backing_file: File) -> Self {
-        Self::new_with_flags(stream, backing_file, libc::MAP_PRIVATE)
-    }
-
-    pub fn new_shared(stream: UnixStream, backing_file: File) -> Self {
-        Self::new_with_flags(stream, backing_file, libc::MAP_SHARED)
-    }
-
-    fn new_with_flags(stream: UnixStream, backing_file: File, map_flags: i32) -> Self {
-        let file_meta = backing_file
-            .metadata()
-            .expect("can not get backing file metadata");
-        let backing_memory_size = file_meta.len() as usize;
-        // # Safety:
-        // File size and fd are valid
-        let ret = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                backing_memory_size,
-                libc::PROT_READ,
-                map_flags | libc::MAP_POPULATE,
-                backing_file.as_raw_fd(),
-                0,
-            )
-        };
-        if ret == libc::MAP_FAILED {
-            panic!("mmap on backing file failed");
-        }
-
+    pub fn new(stream: UnixStream, memory_size: usize) -> Self {
         Self {
             stream,
-            backing_file,
-            backing_memory: ret.cast(),
-            backing_memory_size,
+            memory_size,
             uffds: HashMap::default(),
         }
     }
@@ -312,11 +294,8 @@ impl Runtime {
                     nready -= 1;
                     if pollfds[i].fd == self.stream.as_raw_fd() {
                         // Handle new uffd from stream
-                        let handler = UffdHandler::from_unix_stream(
-                            &self.stream,
-                            self.backing_memory,
-                            self.backing_memory_size,
-                        );
+                        let handler =
+                            UffdHandler::from_unix_stream(&self.stream, self.memory_size);
                         pollfds.push(libc::pollfd {
                             fd: handler.uffd.as_raw_fd(),
                             events: libc::POLLIN,
@@ -364,11 +343,12 @@ mod tests {
             let dummy_mem_path = tmp_file.as_path();
 
             let file = File::open(dummy_mem_path).expect("Cannot open memfile");
+            let memory_size = file.metadata().unwrap().len() as usize;
             let listener =
                 UnixListener::bind(dummy_socket_path).expect("Cannot bind to socket path");
             let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
             // Update runtime with actual runtime
-            let runtime = uninit_runtime.write(Runtime::new(stream, file));
+            let runtime = uninit_runtime.write(Runtime::new(stream, memory_size));
             runtime.run(|_: &mut UffdHandler| {});
         });
 

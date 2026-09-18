@@ -5,9 +5,10 @@ mod uffd_utils;
 
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::ptr;
 
 use serde::Deserialize;
 use uffd_utils::{Runtime, UffdHandler};
@@ -21,23 +22,24 @@ struct UffdRequest {
 }
 
 fn read_request(stream: &mut UnixStream) -> io::Result<UffdRequest> {
-    let mut request = Vec::with_capacity(MAX_REQUEST_SIZE);
-    loop {
-        let mut byte = [0; 1];
-        stream.read_exact(&mut byte)?;
-        if byte[0] == b'\n' {
-            break;
-        }
-        if request.len() == MAX_REQUEST_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "UFFD shared request is too large",
-            ));
-        }
-        request.push(byte[0]);
+    let mut reader = BufReader::new(stream);
+    let mut request = String::with_capacity(MAX_REQUEST_SIZE);
+    let bytes_read = reader.read_line(&mut request)?;
+    if bytes_read == 0 || !request.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "UFFD shared request is not newline-terminated",
+        ));
+    }
+    request.pop();
+    if request.len() > MAX_REQUEST_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "UFFD shared request is too large",
+        ));
     }
 
-    let request: UffdRequest = serde_json::from_slice(&request)
+    let request: UffdRequest = serde_json::from_str(&request)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !request.uffd_shared {
         return Err(io::Error::new(
@@ -59,18 +61,27 @@ fn create_memfd(source: &File) -> io::Result<File> {
     let mut memfd = unsafe { File::from_raw_fd(fd) };
     let size = source.metadata()?.len();
     memfd.set_len(size)?;
-    let mut source = source.try_clone()?;
-    source.seek(SeekFrom::Start(0))?;
-    memfd.seek(SeekFrom::Start(0))?;
-    let copied = io::copy(&mut source, &mut memfd)?;
-    if copied != size {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "snapshot memory file changed while copying",
-        ));
-    }
     memfd.seek(SeekFrom::Start(0))?;
     Ok(memfd)
+}
+
+fn mmap_file(source: &File, protection: i32) -> io::Result<*mut u8> {
+    let size = source.metadata()?.len() as usize;
+    // SAFETY: The source file is valid and its size is non-zero.
+    let mapping = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            size,
+            protection,
+            libc::MAP_PRIVATE | libc::MAP_POPULATE,
+            source.as_raw_fd(),
+            0,
+        )
+    };
+    if mapping == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(mapping.cast())
 }
 
 fn main() {
@@ -88,7 +99,17 @@ fn main() {
         .send_with_fd(&[][..], memfd.as_raw_fd())
         .expect("Cannot send shared memfd");
 
-    let mut runtime = Runtime::new_shared(stream, memfd);
+    let source_memory = mmap_file(&snapshot, libc::PROT_READ).expect("Cannot mmap snapshot memory");
+    let shared_memory = mmap_file(
+        &memfd,
+        libc::PROT_READ | libc::PROT_WRITE,
+    )
+    .expect("Cannot mmap shared memfd");
+    let memory_size = snapshot
+        .metadata()
+        .expect("Cannot stat snapshot memory")
+        .len() as usize;
+    let mut runtime = Runtime::new(stream, memory_size);
     runtime.install_panic_hook();
     runtime.run(|uffd_handler: &mut UffdHandler| {
         let mut deferred_events = Vec::new();
@@ -100,9 +121,16 @@ fn main() {
             for event in events_to_handle.drain(..) {
                 match event {
                     userfaultfd::Event::Pagefault { addr, .. } => {
-                        if !uffd_handler.serve_pf(addr.cast(), uffd_handler.page_size) {
-                            deferred_events.push(event);
-                        }
+                        let fault = uffd_handler.fault_page(addr.cast(), uffd_handler.page_size);
+                        let source = unsafe {
+                            source_memory.add(fault.backing_offset as usize)
+                        };
+                        let destination = unsafe {
+                            shared_memory.add(fault.backing_offset as usize)
+                        };
+                        // SAFETY: The mappings and fault range were validated by UFFD.
+                        unsafe { ptr::copy_nonoverlapping(source, destination, fault.len) };
+                        uffd_handler.continue_fault(fault);
                     }
                     userfaultfd::Event::Remove { start, end } => {
                         uffd_handler.unregister_range(start, end)
@@ -119,6 +147,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]

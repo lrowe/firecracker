@@ -8,7 +8,9 @@
 mod uffd_utils;
 
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
+use std::ptr;
 
 use uffd_utils::{Runtime, UffdHandler};
 
@@ -18,12 +20,25 @@ fn main() {
     let mem_file_path = args.next().expect("No memory file given");
 
     let file = File::open(mem_file_path).expect("Cannot open memfile");
+    let memory_size = file.metadata().expect("Cannot stat memfile").len() as usize;
+    // SAFETY: The backing file is valid and its size is non-zero.
+    let backing_memory = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            memory_size,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_POPULATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(backing_memory, libc::MAP_FAILED, "mmap on memfile failed");
 
     // Get Uffd from UDS. We'll use the uffd to handle PFs for Firecracker.
     let listener = UnixListener::bind(uffd_sock_path).expect("Cannot bind to socket path");
     let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
 
-    let mut runtime = Runtime::new(stream, file);
+    let mut runtime = Runtime::new(stream, memory_size);
     runtime.install_panic_hook();
     runtime.run(|uffd_handler: &mut UffdHandler| {
         // !DISCLAIMER!
@@ -82,7 +97,8 @@ fn main() {
                 // event (if the balloon device is enabled).
                 match event {
                     userfaultfd::Event::Pagefault { addr, .. } => {
-                        if !uffd_handler.serve_pf(addr.cast(), uffd_handler.page_size) {
+                        let fault = uffd_handler.fault_page(addr.cast(), uffd_handler.page_size);
+                        if !uffd_handler.copy_fault(backing_memory.cast(), fault) {
                             deferred_events.push(event);
                         }
                     }

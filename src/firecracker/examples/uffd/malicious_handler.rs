@@ -22,7 +22,8 @@ fn main() {
     let listener = UnixListener::bind(uffd_sock_path).expect("Cannot bind to socket path");
     let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
 
-    let mut runtime = Runtime::new(stream, file);
+    let memory_size = file.metadata().expect("Cannot stat memfile").len() as usize;
+    let mut runtime = Runtime::new(stream, memory_size);
     runtime.run(|uffd_handler: &mut UffdHandler| {
         // Read an event from the userfaultfd.
         let event = uffd_handler
