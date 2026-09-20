@@ -65,7 +65,7 @@ fn create_memfd(source: &File) -> io::Result<File> {
     Ok(memfd)
 }
 
-fn mmap_file(source: &File, protection: i32) -> io::Result<*mut u8> {
+fn mmap_file(source: &File, protection: i32, flags: i32) -> io::Result<*mut u8> {
     let size = source.metadata()?.len() as usize;
     // SAFETY: The source file is valid and its size is non-zero.
     let mapping = unsafe {
@@ -73,7 +73,7 @@ fn mmap_file(source: &File, protection: i32) -> io::Result<*mut u8> {
             ptr::null_mut(),
             size,
             protection,
-            libc::MAP_PRIVATE | libc::MAP_POPULATE,
+            flags,
             source.as_raw_fd(),
             0,
         )
@@ -96,13 +96,15 @@ fn main() {
 
     let memfd = create_memfd(&snapshot).expect("Cannot create shared memfd");
     stream
-        .send_with_fd(&[][..], memfd.as_raw_fd())
+        .send_with_fd(&br#"{"memfd":true}
+"#[..], memfd.as_raw_fd())
         .expect("Cannot send shared memfd");
 
-    let source_memory = mmap_file(&snapshot, libc::PROT_READ).expect("Cannot mmap snapshot memory");
+    let source_memory = mmap_file(&snapshot, libc::PROT_READ, libc::MAP_SHARED).expect("Cannot mmap snapshot memory");
     let shared_memory = mmap_file(
         &memfd,
         libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED
     )
     .expect("Cannot mmap shared memfd");
     let memory_size = snapshot

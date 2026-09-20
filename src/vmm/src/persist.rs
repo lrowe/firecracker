@@ -603,11 +603,15 @@ fn guest_memory_from_uffd(
             .write_all(request.as_bytes())
             .map_err(|_| GuestMemoryFromUffdError::MemfdRequest)?;
 
-        let mut response = [0u8; 1];
+        let mut response = [0u8; 64];
         let (bytes_read, memfd) = socket
             .recv_with_fd(&mut response)
             .map_err(|_| GuestMemoryFromUffdError::MemfdRequest)?;
-        if bytes_read != 0 {
+        let response = std::str::from_utf8(&response[..bytes_read])
+            .map_err(|_| GuestMemoryFromUffdError::MemfdRequest)?;
+        let response: UffdMemfdResponse = serde_json::from_str(response)
+            .map_err(|_| GuestMemoryFromUffdError::MemfdRequest)?;
+        if !response.memfd {
             return Err(GuestMemoryFromUffdError::MemfdRequest);
         }
         let memfd = memfd.ok_or(GuestMemoryFromUffdError::MissingMemfd)?;
@@ -667,6 +671,11 @@ fn guest_memory_from_uffd(
 #[derive(Debug, Serialize, Deserialize)]
 struct UffdRequest {
     uffd_shared: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UffdMemfdResponse {
+    memfd: bool,
 }
 
 fn create_guest_memory_mappings(

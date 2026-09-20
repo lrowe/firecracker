@@ -113,12 +113,13 @@ For the legacy UFFD flow, after Firecracker sends the payload (i.e. mem mappings
 and file descriptor), no other communication happens on the UDS socket. A
 shared UFFD handler uses a two-stage flow on the same connection instead:
 Firecracker first sends the newline-terminated JSON request
-`{"uffd_shared":true}`, and the handler replies with an empty payload and one
-memfd containing the complete snapshot memory file. Firecracker validates the
-memfd size and maps it privately (`MAP_PRIVATE`) so each restored guest keeps
-copy-on-write isolation. The handler retains the memfd and maps a shared view
-(`MAP_SHARED`) as its page-fault source. Firecracker then sends the usual UFFD
-mapping and descriptor handshake on the same socket.
+`{"uffd_shared":true}`, and the handler replies with the JSON payload
+`{"memfd":true}` plus one memfd containing the complete snapshot memory file.
+Firecracker validates the memfd size and maps it privately (`MAP_PRIVATE`) so
+each restored guest keeps copy-on-write isolation. The handler retains the
+memfd and maps a shared view (`MAP_SHARED`) as its page-fault source.
+Firecracker then sends the usual UFFD mapping and descriptor handshake on the
+same socket.
 
 ### Userfaultfd interaction with balloon
 
