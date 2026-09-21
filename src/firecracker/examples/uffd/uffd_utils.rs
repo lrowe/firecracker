@@ -199,6 +199,15 @@ impl UffdHandler {
     pub fn continue_fault(&self, fault: FaultPage) -> bool {
         match self.uffd.r#continue(fault.dst, fault.len, true) {
             Ok(value) => assert!(value > 0),
+            Err(Error::SystemError(errno)) if errno as i32 == libc::EEXIST => {
+                // Expected if the page was already faulted in by another thread.
+                // We can just continue on after waking up the faulting thread, since the page is now ready.
+                // XXX can also happen with vcpu_count=1.
+                match self.uffd.wake(fault.dst, fault.len) {
+                    Ok(()) => (),
+                    Err(error) => panic!("Uffd wake failed: {error:?}"),
+                }
+            }
             Err(error) => panic!("Uffd continue failed: {error:?}"),
         }
 

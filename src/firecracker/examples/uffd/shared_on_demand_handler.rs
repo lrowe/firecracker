@@ -131,7 +131,16 @@ fn main() {
                             shared_memory.add(fault.backing_offset as usize)
                         };
                         // SAFETY: The mappings and fault range were validated by UFFD.
-                        unsafe { ptr::copy_nonoverlapping(source, destination, fault.len) };
+                        unsafe {
+                            let source = source_memory.add(fault.backing_offset as usize);
+                            // pwrite is atomic for a single page
+                            libc::pwrite(
+                                memfd.as_raw_fd(),
+                                source.cast(),
+                                fault.len,
+                                fault.backing_offset as i64,
+                            );
+                        }
                         uffd_handler.continue_fault(fault);
                     }
                     userfaultfd::Event::Remove { start, end } => {
